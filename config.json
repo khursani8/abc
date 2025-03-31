@@ -5,7 +5,7 @@
     "key_secret_env_var": "LUNO_API_KEY_SECRET"
   },
   "analysis": {
-    "symbols": ["SOLMYR", "ETHMYR", "ADAMYR"],
+    "symbols": ["XBTMYR", "SOLMYR", "ETHMYR", "ADAMYR"],
     "fetch_limit_default": 500,
     "fetch_limit_weekly": 300,
     "timeframes": {
@@ -45,8 +45,9 @@
     "rsi_oversold_strong": 30,
     "buy_range_raw_score_threshold": 4,
     "buy_range_timeframes": ["1d", "1w"],
-    "overall_score_threshold": 5.0,
+    "overall_score_threshold": 7.0,
     "adx_threshold": 25,
+    "consecutive_signal_threshold": 2,
     "points": {
       "price_vs_ema": 2,
       "rsi_bb_confirm": 3,
@@ -61,7 +62,15 @@
       "adx_strong_bull": 1,
       "near_daily_support": 2,
       "rsi_divergence": 3,
-      "macd_divergence": 3
+      "macd_divergence": 3,
+      "consecutive_ha_bull_bonus": 1,
+      "consecutive_macd_incr_bonus": 1
     }
+  },
+  "weekly_trend_confirm": {
+      "require_adx": true,
+      "adx_threshold": 20,
+      "require_ha_bull": true,
+      "ha_consecutive_periods": 1
   }
 }

@@ -1,0 +1,7 @@
+aiohttp
+pandas
+numpy
+mplfinance
+matplotlib
+ccxt # Added for exchange interaction
+uvloop # Optional: for performance on Linux/macOS

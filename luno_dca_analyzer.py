@@ -51,12 +51,17 @@ VOLUME_SMA_LENGTH = 20 # For volume confirmation
 PIVOT_LOOKBACK = 2
 # SUPPORT_PROXIMITY_PERCENT = 0.90 # No longer needed for scoring logic
 SUPPORT_PROXIMITY_ATR_MULTIPLIER = 0.75 # Score if price is within 0.75 * ATR above the closest support
+ADX_LENGTH = 14 # Length for ADX calculation
+BUY_RANGE_ATR_MULTIPLIER = 0.5 # Multiplier for ATR to determine buy range width above support
+
 
 # --- Scoring Thresholds (Same as dca_analyzer.py) ---
 RSI_OVERSOLD_STRONG = 30
 BUY_RANGE_RAW_SCORE_THRESHOLD = 4
 BUY_RANGE_TIMEFRAMES = ['1d', '1w']
 OVERALL_SCORE_THRESHOLD = 5.0
+ADX_THRESHOLD = 25 # Threshold for considering a trend strong
+
 
 # --- Continuous Run Settings (Same as dca_analyzer.py) ---
 CHECK_INTERVAL_SECONDS = 4 * 60 * 60 # 4 hours
@@ -274,6 +279,189 @@ def check_bullish_divergence(price_series, indicator_series, lookback=20):
     # Return divergence status and the indicator values at the lows for potential logging/reasoning
     return is_divergence, indicator_at_prev_low, indicator_at_recent_low
 
+# --- ADX Calculation ---
+def calculate_di(high, low, close, length=14):
+    """Calculates the +DI and -DI."""
+    if len(close) < length + 1:
+        return pd.Series(np.nan, index=close.index), pd.Series(np.nan, index=close.index)
+
+    # Calculate True Range (TR) - reuse ATR calculation logic for consistency
+    high_low = high - low
+    high_close = np.abs(high - close.shift())
+    low_close = np.abs(low - close.shift())
+    tr_df = pd.concat([high_low, high_close, low_close], axis=1)
+    tr = tr_df.max(axis=1, skipna=False)
+    atr = tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean() # Smoothed TR (ATR)
+
+    # Calculate Directional Movement (+DM, -DM)
+    move_up = high.diff()
+    move_down = -low.diff()
+    plus_dm = pd.Series(np.where((move_up > move_down) & (move_up > 0), move_up, 0.0), index=close.index)
+    minus_dm = pd.Series(np.where((move_down > move_up) & (move_down > 0), move_down, 0.0), index=close.index)
+
+    # Smooth +DM and -DM
+    smooth_plus_dm = plus_dm.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    smooth_minus_dm = minus_dm.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+
+    # Calculate +DI and -DI
+    plus_di = 100 * (smooth_plus_dm / atr.replace(0, np.nan))
+    minus_di = 100 * (smooth_minus_dm / atr.replace(0, np.nan))
+
+    # Fill initial NaNs if necessary (though smoothing should handle most)
+    plus_di.fillna(0, inplace=True)
+    minus_di.fillna(0, inplace=True)
+
+    return plus_di, minus_di
+
+def calculate_adx(high, low, close, length=14):
+    """Calculates the ADX."""
+    if len(close) < 2 * length: # Need more data for ADX smoothing
+        return pd.Series(np.nan, index=close.index), pd.Series(np.nan, index=close.index), pd.Series(np.nan, index=close.index)
+
+    plus_di, minus_di = calculate_di(high, low, close, length=length)
+
+    # Calculate the Directional Index (DX)
+    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
+    dx.fillna(0, inplace=True) # Fill NaNs in DX (e.g., if +DI and -DI are both 0)
+
+    # Calculate the Average Directional Index (ADX) by smoothing DX
+    adx = dx.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    adx.fillna(0, inplace=True) # Fill initial NaNs
+
+    return adx, plus_di, minus_di
+
+# --- Consecutive Signal Calculation ---
+def calculate_consecutive_true(series):
+    """Calculates the number of consecutive True values ending at each point."""
+    if not isinstance(series, pd.Series) or series.dtype != bool:
+        raise TypeError("Input must be a boolean Pandas Series.")
+
+    # Create shifted series to identify changes
+    shifted = series.shift(1, fill_value=False)
+    # Identify points where the value changes or where a True sequence starts
+    change_points = (series != shifted)
+    # Create groups based on these change points
+    groups = change_points.cumsum()
+    # Calculate cumulative sum within each group where the series is True
+    consecutive_counts = series.groupby(groups).cumsum()
+    # Reset counts to 0 where the original series is False
+    return consecutive_counts.where(series, 0)
+
+
+# --- Heiken Ashi Calculation ---
+def calculate_heiken_ashi(df):
+    """Calculates Heiken Ashi candles."""
+    ha_df = pd.DataFrame(index=df.index)
+    ha_df['HA_Close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+
+    # Calculate initial HA_Open
+    ha_df['HA_Open'] = ((df['open'].shift(1) + df['close'].shift(1)) / 2).fillna((df['open'].iloc[0] + df['close'].iloc[0]) / 2)
+
+    # Iteratively calculate HA_Open for subsequent bars using .loc
+    for i in range(1, len(df)):
+        # Use .loc with the index label to assign the value directly
+        ha_df.loc[ha_df.index[i], 'HA_Open'] = (ha_df.loc[ha_df.index[i-1], 'HA_Open'] + ha_df.loc[ha_df.index[i-1], 'HA_Close']) / 2
+
+    ha_df['HA_High'] = ha_df[['HA_Open', 'HA_Close']].join(df['high']).max(axis=1)
+    ha_df['HA_Low'] = ha_df[['HA_Open', 'HA_Close']].join(df['low']).min(axis=1)
+
+    return ha_df
+
+
+# --- Forecasting Function ---
+def estimate_next_check_time(symbol, weekly_df, weekly_status, daily_support_levels):
+    """
+    Estimates the next time to check based on weekly trend, combining multiple forecast methods.
+    Uses time to EMA50, time for MACD Hist > 0, and time to reach closest daily support.
+    Returns a date range (earliest - latest) or a single date if only one method yields a result.
+    """
+    if weekly_df is None or weekly_df.empty or len(weekly_df) < max(EMA_LENGTH_WEEKLY, MACD_SLOW + MACD_SIGNAL): # Need enough data for EMA50 & MACD
+        return "N/A (No/Short Weekly Data)"
+
+    now = datetime.now(timezone.utc)
+    forecast_dates = [] # Store potential future check dates
+
+    if weekly_status == "Confirmed Bullish":
+        return "Monitor Buy Range" # Already good, check buy range
+
+    try:
+        # --- Prepare Data ---
+        # Ensure necessary indicators are calculated (recalculate for safety)
+        # Avoid modifying the input df directly if it's used elsewhere
+        df_copy = weekly_df.copy()
+        df_copy['EMA50'] = calculate_ema(df_copy['close'], length=EMA_LENGTH_WEEKLY)
+        df_copy['MACD'], df_copy['MACD_Signal'], df_copy['MACD_Hist'] = calculate_macd(df_copy['close'])
+
+        # Check if calculations produced enough non-NaN values at the end
+        if len(df_copy) < 2 or df_copy[['close', 'EMA50', 'MACD_Hist']].iloc[-1].isnull().any():
+             return "N/A (Weekly Calc Error)"
+
+        latest_close = df_copy['close'].iloc[-1]
+        latest_ema50 = df_copy['EMA50'].iloc[-1]
+        latest_hist = df_copy['MACD_Hist'].iloc[-1]
+        prev_hist = df_copy['MACD_Hist'].iloc[-2] if len(df_copy['MACD_Hist'].dropna()) >= 2 else np.nan
+        weekly_range = (df_copy['high'] - df_copy['low']).iloc[-10:].mean() # Avg range last 10 weeks
+
+        # --- Forecast Method 1: Time to cross Weekly EMA50 ---
+        if latest_close < latest_ema50: # Price below EMA
+            price_diff = latest_ema50 - latest_close
+            if pd.notna(weekly_range) and weekly_range > 0:
+                weeks_to_ema = price_diff / weekly_range
+                buffer = 1.5 if weekly_status == "Confirmed Bearish" else 1.2 # Smaller buffer if MACD is improving
+                estimated_weeks = max(1, weeks_to_ema * buffer) # Min 1 week forecast
+                forecast_dates.append(now + timedelta(weeks=estimated_weeks))
+
+        # --- Forecast Method 2: Time for Weekly MACD Histogram > 0 ---
+        if pd.notna(latest_hist) and latest_hist < 0 and pd.notna(prev_hist) and latest_hist > prev_hist: # Negative and increasing
+            recent_hist = df_copy['MACD_Hist'].iloc[-5:].dropna()
+            if len(recent_hist) >= 2:
+                 hist_change_rate = (recent_hist.iloc[-1] - recent_hist.iloc[0]) / (len(recent_hist) -1) if len(recent_hist) > 1 else np.nan
+                 if pd.notna(hist_change_rate) and hist_change_rate > 1e-9: # Ensure rate is positive and non-trivial
+                     weeks_to_zero = abs(latest_hist / hist_change_rate)
+                     estimated_weeks = max(1, weeks_to_zero * 1.3) # Buffer, min 1 week
+                     forecast_dates.append(now + timedelta(weeks=estimated_weeks))
+
+        # --- Forecast Method 3: Time to reach closest Daily Support ---
+        # Find the highest daily support level strictly below the current price
+        supports_below_close = [s for s in daily_support_levels if s < latest_close]
+        if supports_below_close:
+            closest_support = max(supports_below_close)
+            price_diff_support = latest_close - closest_support
+            if pd.notna(weekly_range) and weekly_range > 0:
+                 # Estimate weeks to drop to support (use weekly range as proxy for speed)
+                 weeks_to_support = price_diff_support / weekly_range
+                 # Add a small buffer, maybe less buffer needed for dropping?
+                 buffer = 1.1
+                 estimated_weeks = max(1, weeks_to_support * buffer) # Min 1 week forecast
+                 forecast_dates.append(now + timedelta(weeks=estimated_weeks))
+
+
+        # --- Combine Forecasts ---
+        if forecast_dates:
+            earliest_date = min(forecast_dates)
+            latest_date = max(forecast_dates)
+            if earliest_date == latest_date:
+                return f"Est. Check: {earliest_date.strftime('%Y-%m-%d')}"
+            else:
+                # Ensure latest date is actually later than earliest
+                if latest_date > earliest_date:
+                     return f"Est. Check: {earliest_date.strftime('%Y-%m-%d')} - {latest_date.strftime('%Y-%m-%d')}"
+                else: # Should not happen, but fallback
+                     return f"Est. Check: {earliest_date.strftime('%Y-%m-%d')}"
+        else:
+            # Default check if no specific forecast possible
+            if weekly_status == "Confirmed Bearish":
+                check_date = now + timedelta(days=7) # Check in 1 week
+                return f"Est. Check: {check_date.strftime('%Y-%m-%d')}"
+            else: # Mixed status, no clear forecast derived
+                check_date = now + timedelta(days=3) # Check sooner for mixed signals
+                return f"Est. Check: {check_date.strftime('%Y-%m-%d')}"
+
+
+    except Exception as e:
+        # print(f"Error estimating check time for {symbol}: {e}") # Avoid excessive logging in production
+        return "N/A (Forecast Error)"
+
 
 # --- Scoring Function (Adapted for Luno Timeframes) ---
 def calculate_tf_score(df, timeframe_key): # Use timeframe_key ('1h', '1d', etc.)
@@ -300,6 +488,11 @@ def calculate_tf_score(df, timeframe_key): # Use timeframe_key ('1h', '1d', etc.
     df['OBV'] = calculate_obv(df['close'], df['volume'])
     df['Volume_SMA'] = df['volume'].rolling(window=VOLUME_SMA_LENGTH).mean() # Calculate Volume SMA
     df['ATR'] = calculate_atr(df['high'], df['low'], df['close'], length=ATR_LENGTH) # Ensure ATR is calculated
+    # Calculate ADX
+    df['ADX'], df['PlusDI'], df['MinusDI'] = calculate_adx(df['high'], df['low'], df['close'], length=ADX_LENGTH)
+    # Calculate Heiken Ashi candles
+    ha_df = calculate_heiken_ashi(df)
+    df = df.join(ha_df) # Join HA candles to the main dataframe
 
     # Get latest and previous data points
     if len(df) < 2:
@@ -397,6 +590,38 @@ def calculate_tf_score(df, timeframe_key): # Use timeframe_key ('1h', '1d', etc.
         raw_score += 1 # Score point if OBV is rising
         reasons.append("OBV Rising")
 
+    # Heiken Ashi Momentum Score
+    ha_open = latest['HA_Open']
+    ha_close = latest['HA_Close']
+    ha_low = latest['HA_Low']
+    ha_high = latest['HA_High']
+    ha_bullish = pd.notna(ha_close) and pd.notna(ha_open) and ha_close > ha_open
+    ha_strong_bullish = ha_bullish and ha_open == ha_low # Bullish candle with no lower wick
+    indicator_values['HA Candle'] = 'Bull' if ha_bullish else 'Bear' if pd.notna(ha_close) and pd.notna(ha_open) and ha_close < ha_open else 'Doji'
+    indicator_values['HA Strength'] = 'Strong' if ha_strong_bullish else 'Normal' if ha_bullish else 'N/A'
+
+    if ha_bullish:
+        raw_score += 1 # Basic point for bullish HA candle
+        reasons.append("HA Bull")
+        if ha_strong_bullish:
+            raw_score += 1 # Extra point for strong bullish HA (no lower wick)
+            reasons.append("HA Strong")
+
+    # ADX Trend Strength Score (Bonus if trend is strong and bullish)
+    adx_value = latest['ADX']
+    plus_di_value = latest['PlusDI']
+    minus_di_value = latest['MinusDI']
+    indicator_values['ADX'] = f"{adx_value:.2f}" if pd.notna(adx_value) else "NaN"
+    indicator_values['+DI'] = f"{plus_di_value:.2f}" if pd.notna(plus_di_value) else "NaN"
+    indicator_values['-DI'] = f"{minus_di_value:.2f}" if pd.notna(minus_di_value) else "NaN"
+
+    is_trending = pd.notna(adx_value) and adx_value > ADX_THRESHOLD
+    is_bullish_trend = pd.notna(plus_di_value) and pd.notna(minus_di_value) and plus_di_value > minus_di_value
+    if is_trending and is_bullish_trend:
+        raw_score += 1 # Bonus point for strong bullish trend
+        reasons.append(f"ADX>{ADX_THRESHOLD} Bull")
+
+
     # Proximity to Daily Support Score (Only applies when calculating '1d' score)
     if timeframe_key == '1d':
         # Access the globally stored daily supports for the current symbol
@@ -433,6 +658,36 @@ def calculate_tf_score(df, timeframe_key): # Use timeframe_key ('1h', '1d', etc.
     indicator_values['Reasons'] = ", ".join(reasons) if reasons else "None"
     indicator_values['Buy Range'] = "N/A" # Will be calculated later if conditions met
 
+    # --- Calculate Consecutive Signals ---
+    try:
+        # HA Bullish Consecutive
+        df['HA_Bullish_Signal'] = df['HA_Close'] > df['HA_Open']
+        df['HA_Bull_Consec'] = calculate_consecutive_true(df['HA_Bullish_Signal'])
+        indicator_values['HA Bull Cons'] = int(df['HA_Bull_Consec'].iloc[-1]) if pd.notna(df['HA_Bull_Consec'].iloc[-1]) else 0
+
+        # RSI Oversold Consecutive
+        df['RSI_Oversold_Signal'] = df['RSI'] < RSI_OVERSOLD_STRONG
+        df['RSI_OS_Consec'] = calculate_consecutive_true(df['RSI_Oversold_Signal'])
+        indicator_values['RSI OS Cons'] = int(df['RSI_OS_Consec'].iloc[-1]) if pd.notna(df['RSI_OS_Consec'].iloc[-1]) else 0
+
+        # MACD Hist Increasing Consecutive
+        df['MACD_Hist_Incr_Signal'] = df['MACD_Hist'] > df['MACD_Hist'].shift(1)
+        df['MACD_Hist_Incr_Consec'] = calculate_consecutive_true(df['MACD_Hist_Incr_Signal'])
+        indicator_values['MACD Hist Incr Cons'] = int(df['MACD_Hist_Incr_Consec'].iloc[-1]) if pd.notna(df['MACD_Hist_Incr_Consec'].iloc[-1]) else 0
+
+        # Price <= BB Lower Consecutive
+        df['Price_BB_Lower_Signal'] = df['close'] <= df['BB_Lower']
+        df['Price_BB_Lower_Consec'] = calculate_consecutive_true(df['Price_BB_Lower_Signal'])
+        indicator_values['Price BB Low Cons'] = int(df['Price_BB_Lower_Consec'].iloc[-1]) if pd.notna(df['Price_BB_Lower_Consec'].iloc[-1]) else 0
+
+    except Exception as e:
+        print(f"Error calculating consecutive signals for {timeframe_key}: {e}")
+        indicator_values['HA Bull Cons'] = 'Err'
+        indicator_values['RSI OS Cons'] = 'Err'
+        indicator_values['MACD Hist Incr Cons'] = 'Err'
+        indicator_values['Price BB Low Cons'] = 'Err'
+
+
     return raw_score, indicator_values
 
 # --- Main Execution Logic (Adapted for Luno) ---
@@ -459,6 +714,7 @@ async def run_analysis_cycle(session, previous_scores):
     data_by_symbol_tf = defaultdict(dict)
     weekly_trend_price_ema = {} # Store weekly trend (price vs EMA50)
     weekly_trend_macd = {} # Store weekly trend (MACD vs Signal)
+    weekly_dataframes = {} # Store weekly dataframes for forecasting
     # Reset global dicts for the new cycle
     daily_supports = {}
     daily_resistances = {}
@@ -474,9 +730,10 @@ async def run_analysis_cycle(session, previous_scores):
         if isinstance(result, pd.DataFrame):
             data_by_symbol_tf[symbol][tf_key] = result
 
-            # Calculate weekly trend (using 1w data)
+            # Calculate weekly trend (using 1w data) and store weekly df
             if tf_key == '1w':
-                if len(result) >= EMA_LENGTH_WEEKLY:
+                weekly_dataframes[symbol] = result # Store the weekly dataframe
+                if len(result) >= max(EMA_LENGTH_WEEKLY, MACD_SLOW + MACD_SIGNAL): # Ensure enough data for EMA and MACD
                     weekly_ema = calculate_ema(result['close'], length=EMA_LENGTH_WEEKLY)
                     latest_close = result['close'].iloc[-1]
                     latest_weekly_ema = weekly_ema.iloc[-1]
@@ -598,6 +855,7 @@ async def run_analysis_cycle(session, previous_scores):
                     latest_close_str = indicators.get('Close')
                     bbl_value_str = indicators.get('BB Lower') # Already calculated in score func
                     ema_value_str = indicators.get(f"EMA{EMA_LENGTH_WEEKLY if tf_key == '1w' else EMA_LENGTH}")
+                    atr_value_str = indicators.get('ATR') # Get ATR value
 
                     buy_range_str = "N/A"
                     try:
@@ -617,17 +875,29 @@ async def run_analysis_cycle(session, previous_scores):
                              if supp < latest_close_f: # Only consider supports below current price
                                  potential_supports_below.append(supp)
 
-
                         if potential_supports_below:
-                            # Find the highest support level below the current price
-                            buy_low = max(potential_supports_below)
-                            # Set buy high slightly above the support, but below current price
-                            buy_high = min(buy_low * 1.01, latest_close_f * 0.998) # e.g., 1% above support, or 0.2% below close
+                             # Find the highest support level below the current price
+                             buy_low = max(potential_supports_below)
+                             # Set buy high based on ATR multiplier above the support, but capped below current price
+                             buy_high = latest_close_f # Default cap
+                             try:
+                                 atr_value = float(atr_value_str) if atr_value_str and atr_value_str != "NaN" else np.nan
+                                 if pd.notna(atr_value) and atr_value > 0:
+                                     # Calculate upper bound based on ATR
+                                     atr_based_high = buy_low + (atr_value * BUY_RANGE_ATR_MULTIPLIER)
+                                     # Cap the buy_high at the ATR-based level OR slightly below current close, whichever is lower
+                                     buy_high = min(atr_based_high, latest_close_f * 0.998)
+                                 else:
+                                     # Fallback to percentage if ATR is invalid
+                                     buy_high = min(buy_low * 1.01, latest_close_f * 0.998)
+                             except (ValueError, TypeError):
+                                  # Fallback to percentage on error
+                                  buy_high = min(buy_low * 1.01, latest_close_f * 0.998)
 
-                            if buy_high > buy_low: # Ensure range is valid
-                                buy_range_str = f"{buy_low:.4f} - {buy_high:.4f}"
-                            else: # If high is not > low, just indicate near support
-                                buy_range_str = f"Near {buy_low:.4f}?"
+                             if buy_high > buy_low: # Ensure range is valid
+                                 buy_range_str = f"{buy_low:.4f} - {buy_high:.4f} (ATR)"
+                             else: # If high is not > low, just indicate near support
+                                 buy_range_str = f"Near {buy_low:.4f}?"
                         else: # No clear support found below
                             buy_range_str = f"Below {latest_close_f:.4f}?"
 
@@ -680,9 +950,15 @@ async def run_analysis_cycle(session, previous_scores):
         supports_str = ', '.join(f"{s:.4f}" for s in daily_supports.get(symbol, [])) or "N/A"
         resistances_str = ', '.join(f"{r:.4f}" for r in daily_resistances.get(symbol, [])) or "N/A"
 
+        # Get forecast using the specific symbol's daily supports
+        weekly_df = weekly_dataframes.get(symbol)
+        symbol_supports = daily_supports.get(symbol, []) # Get supports for this symbol
+        forecast_str = estimate_next_check_time(symbol, weekly_df, trend_status, symbol_supports)
+
         # Symbol Header
         output_lines.append(f"\n*{symbol}* ({highlight}Score: {overall_score:.2f})")
         output_lines.append(f"Weekly Trend: {trend_status}")
+        output_lines.append(f"Forecast: {forecast_str}") # Add forecast here
         output_lines.append(f"Supports (1d): {supports_str}")
         output_lines.append(f"Resistances (1d): {resistances_str}")
         output_lines.append("--- Timeframes ---")
@@ -703,7 +979,14 @@ async def run_analysis_cycle(session, previous_scores):
                 close_str = indicators.get('Close', 'N/A')
                 buy_range_str = indicators.get('Buy Range', 'N/A')
                 reasons_str = indicators.get('Reasons', 'N/A')
-                tf_line += f"Raw: {str(raw_s)} | Wght: {weighted_s_str} | Close: {close_str} | BuyRng: {buy_range_str} | Reasons: {reasons_str}"
+                # Add consecutive counts to output string
+                ha_cons = indicators.get('HA Bull Cons', 0)
+                rsi_cons = indicators.get('RSI OS Cons', 0)
+                macd_cons = indicators.get('MACD Hist Incr Cons', 0)
+                bb_cons = indicators.get('Price BB Low Cons', 0)
+                cons_str = f"Cons(HA:{ha_cons},RSI_OS:{rsi_cons},MACD+:{macd_cons},BB_Low:{bb_cons})"
+
+                tf_line += f"Raw: {str(raw_s)} | Wght: {weighted_s_str} | Close: {close_str} | BuyRng: {buy_range_str} | {cons_str} | Reasons: {reasons_str}"
             output_lines.append(tf_line)
         output_lines.append("-" * 20) # Separator
 

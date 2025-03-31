@@ -1,0 +1,67 @@
+{
+  "api": {
+    "base_url": "https://api.luno.com/api/exchange/1",
+    "key_id_env_var": "LUNO_API_KEY_ID",
+    "key_secret_env_var": "LUNO_API_KEY_SECRET"
+  },
+  "analysis": {
+    "symbols": ["SOLMYR", "ETHMYR", "ADAMYR"],
+    "fetch_limit_default": 500,
+    "fetch_limit_weekly": 300,
+    "timeframes": {
+      "1h": 3600,
+      "4h": 14400,
+      "1d": 86400,
+      "1w": 604800
+    },
+    "tf_weights": {
+      "1h": 0.5,
+      "4h": 0.75,
+      "1d": 1.0,
+      "1w": 1.25
+    },
+    "check_interval_seconds": 14400
+  },
+  "indicators": {
+    "rsi_length": 14,
+    "ema_length": 200,
+    "ema_length_weekly": 50,
+    "bbands_length": 20,
+    "bbands_stddev": 2.0,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "atr_length": 14,
+    "supertrend_factor_1": 3.0,
+    "supertrend_factor_2": 2.0,
+    "obv_smoothing": 5,
+    "volume_sma_length": 20,
+    "pivot_lookback": 2,
+    "support_proximity_atr_multiplier": 0.75,
+    "adx_length": 14,
+    "buy_range_atr_multiplier": 0.5
+  },
+  "scoring": {
+    "rsi_oversold_strong": 30,
+    "buy_range_raw_score_threshold": 4,
+    "buy_range_timeframes": ["1d", "1w"],
+    "overall_score_threshold": 5.0,
+    "adx_threshold": 25,
+    "points": {
+      "price_vs_ema": 2,
+      "rsi_bb_confirm": 3,
+      "rsi_bb_vol_bonus": 1,
+      "macd_vs_signal": 1,
+      "macd_hist_incr": 1,
+      "macd_hist_wkly_confirm": 1,
+      "supertrend_confirm": 2,
+      "obv_rising": 1,
+      "ha_bull": 1,
+      "ha_strong": 1,
+      "adx_strong_bull": 1,
+      "near_daily_support": 2,
+      "rsi_divergence": 3,
+      "macd_divergence": 3
+    }
+  }
+}

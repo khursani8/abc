@@ -5,7 +5,7 @@
     "key_secret_env_var": "LUNO_API_KEY_SECRET"
   },
   "analysis": {
-    "symbols": ["XBTMYR", "SOLMYR", "ETHMYR", "ADAMYR"],
+    "symbols": ["SOLMYR", "ETHMYR", "ADAMYR"],
     "fetch_limit_default": 500,
     "fetch_limit_weekly": 300,
     "timeframes": {

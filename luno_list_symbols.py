@@ -20,6 +20,7 @@ async def get_luno_symbols():
                     return
 
                 pairs = sorted([ticker.get('pair') for ticker in tickers if ticker.get('pair')])
+                pairs = [i for i in pairs if 'MYR' in i]
                 if pairs:
                     print("\nAvailable Luno Trading Pairs:")
                     # Print in columns for better readability if many pairs

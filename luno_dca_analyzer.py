@@ -4,8 +4,11 @@ import pandas as pd
 import numpy as np
 import os
 import time
-import subprocess # For notifications
+import subprocess # Keep for potential future use, but won't be called for email
 import json # Added for config loading
+import smtplib
+import ssl
+from email.message import EmailMessage # For constructing email
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from aiohttp import BasicAuth
@@ -81,20 +84,52 @@ WT_REQUIRE_HA_BULL = weekly_confirm_cfg.get('require_ha_bull', True)
 WT_HA_CONSECUTIVE = weekly_confirm_cfg.get('ha_consecutive_periods', 1)
 
 
-# --- Notification Function (Same as before) ---
-def send_notification(symbol, score):
-    title = f"Luno DCA Alert: {symbol}"
-    message = f"Potential DCA opportunity detected for {symbol}.\nOverall Weighted Score: {score:.2f}"
+# --- Email Notification Function ---
+def send_email_notification(symbol, score):
+    """Sends an email notification using Gmail SMTP."""
+    sender_email = os.getenv('EMAIL_SENDER')
+    receiver_email = os.getenv('EMAIL_RECIPIENT')
+    app_password = os.getenv('EMAIL_APP_PASSWORD')
+
+    if not sender_email or not receiver_email or not app_password:
+        print("Warning: Email credentials (EMAIL_SENDER, EMAIL_RECIPIENT, EMAIL_APP_PASSWORD) not found in environment variables. Skipping email notification.")
+        return
+
+    subject = f"Luno DCA Alert: {symbol} Threshold Crossed!"
+    body = f"""
+Potential DCA opportunity detected for {symbol}.
+
+Overall Weighted Score: {score:.2f}
+(Threshold: {OVERALL_SCORE_THRESHOLD:.1f})
+
+Check the GitHub Actions logs for detailed analysis.
+Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    em = EmailMessage()
+    em['From'] = sender_email
+    em['To'] = receiver_email
+    em['Subject'] = subject
+    em.set_content(body)
+
+    # Add SSL context
+    context = ssl.create_default_context()
+
     try:
-        # Check if notify-send exists
-        if subprocess.run(['which', 'notify-send'], capture_output=True, text=True).returncode == 0:
-            subprocess.run(['notify-send', title, message], check=False, timeout=10)
-            print(f"--- Notification attempted for {symbol} ---")
-        else:
-            print("Warning: 'notify-send' command not found. Skipping notification.")
-    except FileNotFoundError: print("Warning: 'notify-send' command not found.")
-    except subprocess.TimeoutExpired: print("Warning: 'notify-send' command timed out.")
-    except Exception as e: print(f"Warning: Failed to send notification for {symbol}: {e}")
+        print(f"Attempting to send email notification for {symbol} to {receiver_email}...")
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as smtp:
+            smtp.login(sender_email, app_password)
+            smtp.sendmail(sender_email, receiver_email, em.as_string())
+        print(f"--- Email notification successfully sent for {symbol} ---")
+    except smtplib.SMTPAuthenticationError:
+        print("ERROR: Gmail SMTP Authentication failed. Check sender email and App Password.")
+    except smtplib.SMTPConnectError:
+         print("ERROR: Could not connect to Gmail SMTP server. Check network/firewall.")
+    except Exception as e:
+        print(f"ERROR: Failed to send email notification for {symbol}: {e}")
+
+# --- (Original send_notification function commented out or removed) ---
+# def send_notification(symbol, score): ...
 
 # --- Data Fetching (Adapted for Luno - uses config) ---
 async def get_kline_data_dca(session, pair, duration_seconds, limit):
@@ -638,7 +673,7 @@ async def run_analysis_cycle(session, previous_scores):
         last_score = previous_scores.get(symbol, 0)
         if current_overall_score >= OVERALL_SCORE_THRESHOLD and last_score < OVERALL_SCORE_THRESHOLD:
             print(f"--- Threshold crossed for {symbol} ({last_score:.2f} -> {current_overall_score:.2f}) ---")
-            send_notification(symbol, current_overall_score)
+            send_email_notification(symbol, current_overall_score) # Call the new email function
         elif current_overall_score < OVERALL_SCORE_THRESHOLD and last_score >= OVERALL_SCORE_THRESHOLD:
              print(f"--- {symbol} dropped below threshold ({last_score:.2f} -> {current_overall_score:.2f}) ---")
 

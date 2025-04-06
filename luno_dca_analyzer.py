@@ -2,8 +2,12 @@ import asyncio
 import aiohttp
 import pandas as pd
 import numpy as np
+from numpy.polynomial.polynomial import Polynomial # For trendline fitting
 import os
 import time
+import matplotlib
+matplotlib.use('Agg') # Use non-interactive backend for saving files
+import matplotlib.pyplot as plt
 import subprocess # Keep for potential future use, but won't be called for email
 import json # Added for config loading
 import smtplib
@@ -45,6 +49,7 @@ TIMEFRAME_MAP_LUNO = config.get('analysis', {}).get('timeframes', {})
 TIMEFRAMES_DCA = list(TIMEFRAME_MAP_LUNO.keys())
 TF_WEIGHTS = config.get('analysis', {}).get('tf_weights', {})
 CHECK_INTERVAL_SECONDS = config.get('analysis', {}).get('check_interval_seconds', 14400) # Default 4 hours
+PLOT_SAVE_DIR = config.get('analysis', {}).get('plot_save_dir', 'plots') # Directory to save plots
 
 # Indicators
 indicators_cfg = config.get('indicators', {})
@@ -273,6 +278,93 @@ def find_pivot_highs(high_series, n=PIVOT_LOOKBACK): # Use config default
     is_pivot = is_higher_than_prev & is_higher_than_next
     return is_pivot
 
+# --- Trendline Calculation ---
+def calculate_trendline(price_series, pivot_indices, lookback_pivots=2):
+    """Calculates a trendline based on the last N pivot points."""
+    if pivot_indices.sum() < lookback_pivots:
+        # print(f"Debug: Not enough pivots ({pivot_indices.sum()}) for trendline.")
+        return None, None, None, None # Not enough pivots
+
+    # Get the indices (timestamps) and values of the last N pivots
+    pivot_timestamps = price_series.index[pivot_indices][-lookback_pivots:]
+    pivot_values = price_series[pivot_indices][-lookback_pivots:]
+
+    if len(pivot_timestamps) < 2:
+        # print(f"Debug: Filtered pivots less than 2 ({len(pivot_timestamps)}).")
+        return None, None, None, None # Still not enough after filtering potential NaNs etc.
+
+    # Convert timestamps to numerical values (e.g., seconds since epoch) for regression
+    pivot_times_numeric = pivot_timestamps.astype(np.int64) // 10**9 # Use nanoseconds then convert to seconds
+
+    try:
+        # Fit a linear polynomial (degree 1)
+        coeffs = Polynomial.fit(pivot_times_numeric, pivot_values.values, 1).convert().coef
+        # coeffs will be [intercept, slope]
+        if len(coeffs) != 2:
+            # print(f"Debug: Polyfit did not return 2 coefficients ({len(coeffs)}).")
+            return None, None, None, None
+
+        slope = coeffs[1]
+        intercept = coeffs[0]
+
+        # Calculate the trendline value at the latest timestamp
+        latest_time_numeric = price_series.index[-1].astype(np.int64) // 10**9
+        current_trendline_value = slope * latest_time_numeric + intercept
+
+        # Calculate trendline values for plotting across the pivot range
+        trendline_plot_times = pivot_times_numeric
+        trendline_plot_values = slope * trendline_plot_times + intercept
+
+        # print(f"Debug: Trendline calculated: slope={slope:.4f}, intercept={intercept:.4f}, current_val={current_trendline_value:.4f}")
+        return current_trendline_value, slope, pivot_timestamps, trendline_plot_values
+    except Exception as e:
+        # print(f"Debug: Error during polyfit or trendline calculation: {e}")
+        return None, None, None, None
+
+# --- Plotting Function ---
+def plot_and_save_trendline(df, symbol, timeframe_key, pivot_lows_series, current_trendline_value, trendline_slope, pivot_timestamps, trendline_plot_values):
+    """Generates and saves a plot of price, pivot lows, and the trendline."""
+    if current_trendline_value is None or pivot_timestamps is None or trendline_plot_values is None:
+        print(f"Info: Skipping plot for {symbol} {timeframe_key} due to missing trendline data.")
+        return
+
+    try:
+        plt.figure(figsize=(12, 6))
+        plot_data = df.iloc[-60:] # Plot last 60 periods for context
+
+        # Plot closing price
+        plt.plot(plot_data.index, plot_data['close'], label='Close Price', color='blue', linewidth=1)
+
+        # Highlight pivot lows used for trendline
+        pivot_low_values = df['low'][pivot_timestamps]
+        plt.scatter(pivot_timestamps, pivot_low_values, color='red', marker='o', s=50, label='Pivot Lows Used')
+
+        # Plot the calculated trendline segment
+        plt.plot(pivot_timestamps, trendline_plot_values, color='green', linestyle='--', linewidth=2, label=f'Trendline (Slope: {trendline_slope:.4f})')
+
+        plt.title(f'{symbol} - {timeframe_key.upper()} Trendline Analysis')
+        plt.xlabel('Date')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+
+        # Ensure plot directory exists
+        if not os.path.exists(PLOT_SAVE_DIR):
+            os.makedirs(PLOT_SAVE_DIR)
+            print(f"Created plot directory: {PLOT_SAVE_DIR}")
+
+        # Save the plot
+        filename = f"{PLOT_SAVE_DIR}/{symbol}_{timeframe_key}_trendline.png"
+        plt.savefig(filename)
+        plt.close() # Close the figure to free memory
+        print(f"Saved trendline plot: {filename}")
+
+    except Exception as e:
+        print(f"ERROR: Failed to generate or save plot for {symbol} {timeframe_key}: {e}")
+        plt.close() # Ensure figure is closed even on error
+
+
 def check_bullish_divergence(price_series, indicator_series, lookback=20): # Lookback kept hardcoded for now, could be config
     if len(price_series) < lookback + 1 or indicator_series.isnull().sum() > lookback // 2:
         return False, None, None
@@ -484,12 +576,38 @@ def calculate_tf_score(df, timeframe_key):
             if latest_close >= closest_support and latest_close <= proximity_upper_bound:
                  raw_score += POINTS.get('near_daily_support', 0); reasons.append(f"Near D Supp({closest_support:.4f}, ATR)")
 
-    # Divergence (Daily only)
+    # Divergence & Trendline (Daily only)
     if timeframe_key == '1d':
+        symbol = df.name # Get symbol from df name attribute
+        # Divergence
         rsi_divergence, _, _ = check_bullish_divergence(df['low'], df['RSI'])
         macd_hist_divergence, _, _ = check_bullish_divergence(df['low'], df['MACD_Hist'])
         if rsi_divergence: raw_score += POINTS.get('rsi_divergence', 0); reasons.append("RSI Bull Div"); indicator_values['RSI Divergence'] = 'Yes'
         if macd_hist_divergence: raw_score += POINTS.get('macd_divergence', 0); reasons.append("MACD Bull Div"); indicator_values['MACD Divergence'] = 'Yes'
+
+        # Trendline Check (Support Trendline using Pivot Lows)
+        pivot_lows_series = find_pivot_lows(df['low'])
+        current_trendline_value, trendline_slope, pivot_timestamps, trendline_plot_values = calculate_trendline(df['low'], pivot_lows_series, lookback_pivots=2) # Use last 2 pivot lows
+
+        indicator_values['Trendline'] = "N/A"
+        if current_trendline_value is not None:
+            is_above_trendline = latest_close > current_trendline_value
+            trend_status_str = "Above" if is_above_trendline else "Below"
+            slope_str = "Up" if trendline_slope > 0 else "Down" if trendline_slope < 0 else "Flat"
+            indicator_values['Trendline'] = f"{trend_status_str} ({slope_str}, {current_trendline_value:.4f})"
+
+            if not is_above_trendline:
+                # Apply penalty if price is below the support trendline
+                penalty = POINTS.get('below_trendline_penalty', -5) # Default penalty -5 if not in config
+                raw_score += penalty
+                reasons.append(f"Below Trendline ({penalty})")
+
+            # Plotting
+            plot_and_save_trendline(df, symbol, timeframe_key, pivot_lows_series, current_trendline_value, trendline_slope, pivot_timestamps, trendline_plot_values)
+
+        else:
+            indicator_values['Trendline'] = "Calc Error"
+
 
     indicator_values['Raw Score'] = raw_score
 
@@ -626,7 +744,7 @@ async def run_analysis_cycle(session, previous_scores):
             if tf_key in ['1h', '4h', '1d'] and not is_strong_weekly_bullish:
                 analysis_results[symbol]['timeframes'][tf_key] = {"Info": f"Skipped (Weekly: {weekly_status_str})"}; continue
 
-            df_copy = df.copy(); df_copy.name = symbol
+            df_copy = df.copy(); df_copy.name = symbol # Assign name for plotting
             raw_score, indicators = calculate_tf_score(df_copy, tf_key)
 
             if raw_score is not None:
@@ -713,8 +831,11 @@ async def run_analysis_cycle(session, previous_scores):
                 macd_cons = indicators.get('MACD Hist Incr Cons', 0); bb_cons = indicators.get('Price BB Low Cons', 0)
                 cons_str = f"Cons(HA:{ha_cons},RSI_OS:{rsi_cons},MACD+:{macd_cons},BB_Low:{bb_cons})"
                 detail_str = f"ADX:{adx_str}(+{plus_di_str}|-{minus_di_str}) HA:{ha_candle}({ha_strength})"
+                trendline_str = indicators.get('Trendline', 'N/A') if tf_key == '1d' else '' # Show only for daily
 
-                tf_line += f"Raw:{str(raw_s)}|Wght:{weighted_s_str}|Close:{close_str}|BuyRng:{buy_range_str}|{detail_str}|{cons_str}|Reasons:{reasons_str}"
+                tf_line += f"Raw:{str(raw_s)}|Wght:{weighted_s_str}|Close:{close_str}|BuyRng:{buy_range_str}"
+                if trendline_str: tf_line += f"|TrendLn:{trendline_str}" # Add trendline info
+                tf_line += f"|{detail_str}|{cons_str}|Reasons:{reasons_str}"
             output_lines.append(tf_line)
         output_lines.append("-" * 20)
 
@@ -734,6 +855,7 @@ async def main_loop():
     print(f"Using timeframes: {', '.join(TIMEFRAMES_DCA)}")
     print(f"Notification threshold: {OVERALL_SCORE_THRESHOLD:.1f}")
     print(f"Check interval: {CHECK_INTERVAL_SECONDS / 3600:.1f} hours")
+    print(f"Saving plots to: {PLOT_SAVE_DIR}") # Inform user where plots are saved
 
     previous_scores = {}
     while True:

@@ -30,10 +30,10 @@ jobs:
           LUNO_API_KEY_ID: ${{ secrets.LUNO_API_KEY_ID }}
           LUNO_API_KEY_SECRET: ${{ secrets.LUNO_API_KEY_SECRET }}
 
-          # Email Credentials
-          EMAIL_SENDER: 'khursani8@gmail.com' # Your sender email
-          EMAIL_RECIPIENT: 'khursani8@gmail.com' # Your recipient email
-          EMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }} # Use a new secret for the App Password
+          # Email Credentials (from secrets)
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          EMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }} # Ensure this secret name matches what you create
 
           # Ensure PYTHONUNBUFFERED is set so output appears in logs immediately
           PYTHONUNBUFFERED: 1

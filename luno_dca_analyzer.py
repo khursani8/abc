@@ -90,7 +90,7 @@ WT_HA_CONSECUTIVE = weekly_confirm_cfg.get('ha_consecutive_periods', 1)
 
 
 # --- Email Notification Function ---
-def send_email_notification(symbol, score):
+def send_email_notification(symbol, score, is_test=False): # Added is_test flag
     """Sends an email notification using Gmail SMTP."""
     sender_email = os.getenv('EMAIL_SENDER')
     receiver_email = os.getenv('EMAIL_RECIPIENT')
@@ -100,9 +100,12 @@ def send_email_notification(symbol, score):
         print("Warning: Email credentials (EMAIL_SENDER, EMAIL_RECIPIENT, EMAIL_APP_PASSWORD) not found in environment variables. Skipping email notification.")
         return
 
-    subject = f"Luno DCA Alert: {symbol} Threshold Crossed!"
+    subject = f"[TEST] Luno DCA Alert: {symbol}" if is_test else f"Luno DCA Alert: {symbol} Threshold Crossed!"
     body = f"""
-Potential DCA opportunity detected for {symbol}.
+{'TEST EMAIL: This email confirms the notification system is working.' if is_test else f'Potential DCA opportunity detected for {symbol}.'}
+
+Overall Weighted Score: {score:.2f}
+(Threshold: {OVERALL_SCORE_THRESHOLD:.1f})
 
 Overall Weighted Score: {score:.2f}
 (Threshold: {OVERALL_SCORE_THRESHOLD:.1f})
@@ -695,8 +698,16 @@ async def run_analysis_cycle(session, previous_scores):
     # --- Perform Analysis (Second Pass - Scoring & Weekly Trend Check) ---
     analysis_results = defaultdict(lambda: {'overall_score': 0.0, 'timeframes': {}, 'weekly_status': 'Unknown'})
     current_scores = {}
+    test_email_sent = False # Flag to send only one test email
 
     for symbol, tf_data in data_by_symbol_tf.items():
+        # --- TEMPORARY: Send test email for the first symbol ---
+        if not test_email_sent:
+            print(f"--- Sending TEST email for symbol: {symbol} ---")
+            send_email_notification(symbol, 0.0, is_test=True) # Send test email with dummy score
+            test_email_sent = True
+        # --- END TEMPORARY ---
+
         weekly_df = weekly_dataframes.get(symbol)
         weekly_status_str = "Unknown"
         is_strong_weekly_bullish = False

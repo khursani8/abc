@@ -698,7 +698,7 @@ async def run_analysis_cycle(session, previous_scores):
     # --- Perform Analysis (Second Pass - Scoring & Weekly Trend Check) ---
     analysis_results = defaultdict(lambda: {'overall_score': 0.0, 'timeframes': {}, 'weekly_status': 'Unknown'})
     current_scores = {}
-    test_email_sent = False # Flag to send only one test email
+    test_email_sent = True # Flag to send only one test email
 
     for symbol, tf_data in data_by_symbol_tf.items():
         # --- TEMPORARY: Send test email for the first symbol ---

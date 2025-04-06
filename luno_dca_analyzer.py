@@ -704,7 +704,7 @@ async def run_analysis_cycle(session, previous_scores):
         # --- TEMPORARY: Send test email for the first symbol ---
         if not test_email_sent:
             print(f"--- Sending TEST email for symbol: {symbol} ---")
-            send_email_notification(symbol, 0.0, is_test=True) # Send test email with dummy score
+            send_email_notification(symbol, 0.0, is_test=False) # Send test email with dummy score
             test_email_sent = True
         # --- END TEMPORARY ---
 

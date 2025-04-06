@@ -858,26 +858,28 @@ async def main_loop():
     print(f"Saving plots to: {PLOT_SAVE_DIR}") # Inform user where plots are saved
 
     previous_scores = {}
-    while True:
-        try:
-            timeout = aiohttp.ClientTimeout(total=120) # Increased timeout slightly
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                 current_scores = await run_analysis_cycle(session, previous_scores)
-                 previous_scores = current_scores
-        except aiohttp.ClientConnectorError as e:
-            print(f"Network connection error: {e}. Retrying after delay...")
-            await asyncio.sleep(60)
-        except asyncio.TimeoutError:
-             print(f"Network operation timed out. Retrying after delay...")
-             await asyncio.sleep(60)
-        except Exception as e:
-            print(f"An unexpected error occurred in main loop: {e}")
-            import traceback
-            traceback.print_exc() # Print full traceback for debugging
-            await asyncio.sleep(300)
+    # Removed the while True loop for single execution in GitHub Actions
+    try:
+        timeout = aiohttp.ClientTimeout(total=120) # Increased timeout slightly
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+             # Run the analysis cycle once
+             current_scores = await run_analysis_cycle(session, previous_scores)
+             # previous_scores = current_scores # No need to store for next loop
+    except aiohttp.ClientConnectorError as e:
+        print(f"Network connection error: {e}.")
+        # Removed retry logic as it's a single run
+    except asyncio.TimeoutError:
+         print(f"Network operation timed out.")
+         # Removed retry logic
+    except Exception as e:
+        print(f"An unexpected error occurred during analysis: {e}")
+        import traceback
+        traceback.print_exc() # Print full traceback for debugging
+        # Removed sleep
 
-        print(f"\nWaiting for {CHECK_INTERVAL_SECONDS / 3600:.1f} hours until next check...")
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+    # Removed the waiting message and sleep call
+    # print(f"\nWaiting for {CHECK_INTERVAL_SECONDS / 3600:.1f} hours until next check...")
+    # await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     try:

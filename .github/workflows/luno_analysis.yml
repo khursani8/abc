@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs every 4 hours (adjust cron schedule as needed)
     # See: https://crontab.guru/every-4-hours
-    - cron: '0 * 1/7 * *'
+    - cron: '0 7 * * 1'
   workflow_dispatch: # Allows manual triggering from the Actions tab
 
 jobs:
